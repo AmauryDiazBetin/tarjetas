@@ -12,25 +12,14 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 const char* ssid = "V:";
 const char* password = "12345678";
-const char* serverUrl = "https://pruepas.onrender.com/api/historial";
+
+// URLs de tu API
+const char* verificarTarjetaUrl = "https://tu-api.onrender.com/api/verificar-tarjeta";
+const char* registrarAccesoUrl = "https://tu-api.onrender.com/api/registrar-acceso";
 
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = -5 * 3600;
 const int daylightOffset_sec = 0;
-
-// Base de datos local de tarjetas autorizadas
-struct TarjetaAutorizada {
-  String uid;
-  String nombre;
-  String tipoAcceso;
-};
-
-const int MAX_TARJETAS = 50;
-TarjetaAutorizada baseDeDatosTarjetas[MAX_TARJETAS] = {
-  {"A1B2C3D4", "Juan Pérez", "admin"},
-  {"B5C6D7E8", "María Gómez", "empleado"},
-  {"C9D0E1F2", "Carlos Ruiz", "visitante"}
-};
 
 void setup() {
   Serial.begin(115200);
@@ -39,19 +28,11 @@ void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
   
-  Serial.println("=== Lector RFID MIFARE Classic 1K Iniciado ===");
+  Serial.println("=== Lector RFID con Base de Datos Externa ===");
   conectarWiFi();
   configurarHora();
   
-  // Mostrar base de datos cargada
-  Serial.println("\nBase de Datos Cargada:");
-  for (int i = 0; i < MAX_TARJETAS; i++) {
-    if (baseDeDatosTarjetas[i].uid.length() > 0) {
-      Serial.print("UID: " + baseDeDatosTarjetas[i].uid);
-      Serial.print(" - Nombre: " + baseDeDatosTarjetas[i].nombre);
-      Serial.println(" - Acceso: " + baseDeDatosTarjetas[i].tipoAcceso);
-    }
-  }
+  Serial.println("\nSistema listo para leer tarjetas RFID");
 }
 
 void loop() {
@@ -180,66 +161,103 @@ void procesarTarjeta() {
   Serial.println("║ Fecha/Hora: " + fechaHora + String(40 - fechaHora.length() - 12, ' ') + "║");
   Serial.println("╚════════════════════════════════════════╝");
 
-  // Buscar en la base de datos local
-  bool autorizada = false;
-  String nombre = "";
-  String tipoAcceso = "";
-  
-  for (int i = 0; i < MAX_TARJETAS; i++) {
-    if (baseDeDatosTarjetas[i].uid.equalsIgnoreCase(uid)) {
-      autorizada = true;
-      nombre = baseDeDatosTarjetas[i].nombre;
-      tipoAcceso = baseDeDatosTarjetas[i].tipoAcceso;
-      break;
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n✗ Sin conexión WiFi - No se puede verificar la tarjeta");
+    return;
   }
+
+  // Verificar tarjeta en la base de datos
+  bool autorizada = verificarTarjetaEnBD(uid);
   
   if (autorizada) {
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║           ACCESO AUTORIZADO           ║");
+    Serial.println("║           ACCESO AUTORIZADO            ║");
     Serial.println("╠════════════════════════════════════════╣");
-    Serial.println("║ Nombre: " + nombre + String(40 - nombre.length() - 9, ' ') + "║");
-    Serial.println("║ Tipo Acceso: " + tipoAcceso + String(40 - tipoAcceso.length() - 13, ' ') + "║");
+    Serial.println("║ UID: " + uid + String(40 - uid.length() - 6, ' ') + "║");
     Serial.println("╚════════════════════════════════════════╝");
     
-    // Registrar acceso en el servidor
-    if (WiFi.status() == WL_CONNECTED) {
-      registrarAccesoServidor(uid, nombre, tipoAcceso, fechaHora, true);
-    }
+    // Registrar acceso exitoso
+    registrarAccesoEnBD(uid, fechaHora, true);
   } else {
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║           ACCESO DENEGADO             ║");
+    Serial.println("║           ACCESO DENEGADO              ║");
     Serial.println("╠════════════════════════════════════════╣");
-    Serial.println("║ Razón: Tarjeta no registrada          ║");
+    Serial.println("║ Razón: UID no autorizada               ║");
+    Serial.println("║ UID: " + uid + String(40 - uid.length() - 6, ' ') + "║");
     Serial.println("╚════════════════════════════════════════╝");
     
-    if (WiFi.status() == WL_CONNECTED) {
-      registrarAccesoServidor(uid, "Desconocido", "no_autorizado", fechaHora, false);
-    }
+    // Registrar intento de acceso denegado
+    registrarAccesoEnBD(uid, fechaHora, false);
   }
 }
 
-void registrarAccesoServidor(String uid, String nombre, String tipoAcceso, String fechaHora, bool autorizado) {
-  Serial.println("\n=== REGISTRANDO ACCESO EN SERVIDOR ===");
+bool verificarTarjetaEnBD(String uid) {
+  Serial.println("\n=== VERIFICANDO UID EN BASE DE DATOS ===");
   
   HTTPClient http;
-  http.begin(serverUrl);
+  http.begin(verificarTarjetaUrl);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  StaticJsonDocument<200> doc;
+  doc["uid"] = uid;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  Serial.println("URL: " + String(verificarTarjetaUrl));
+  Serial.println("Datos JSON: " + jsonString);
+  
+  int httpCode = http.POST(jsonString);
+  bool autorizada = false;
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.println("Código de respuesta: " + String(httpCode));
+    Serial.println("Respuesta servidor: " + payload);
+    
+    if (httpCode == HTTP_CODE_OK) {
+      StaticJsonDocument<300> respuesta;
+      DeserializationError error = deserializeJson(respuesta, payload);
+      
+      if (!error) {
+        autorizada = respuesta["autorizada"] | false;
+        if (respuesta.containsKey("mensaje")) {
+          Serial.println("Mensaje: " + String(respuesta["mensaje"].as<const char*>()));
+        }
+      } else {
+        Serial.println("Error al parsear respuesta JSON");
+      }
+    }
+  } else {
+    Serial.println("✗ Error de conexión HTTP: " + String(httpCode));
+  }
+  
+  http.end();
+  Serial.println("========================================");
+  
+  return autorizada;
+}
+
+void registrarAccesoEnBD(String uid, String fechaHora, bool autorizado) {
+  Serial.println("\n=== REGISTRANDO ACCESO EN BASE DE DATOS ===");
+  
+  HTTPClient http;
+  http.begin(registrarAccesoUrl);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(15000);
 
-  StaticJsonDocument<300> doc;
+  StaticJsonDocument<400> doc;
   doc["uid"] = uid;
-  doc["nombre"] = nombre;
-  doc["tipo_acceso"] = tipoAcceso;
   doc["fecha_hora"] = fechaHora;
-  doc["autorizado"] = autorizado;
   doc["fecha_iso"] = obtenerFechaHoraISO();
+  doc["autorizado"] = autorizado;
   doc["timestamp"] = millis();
 
   String jsonString;
   serializeJson(doc, jsonString);
   
-  Serial.println("URL: " + String(serverUrl));
+  Serial.println("URL: " + String(registrarAccesoUrl));
   Serial.println("Datos JSON: " + jsonString);
   
   int httpCode = http.POST(jsonString);
@@ -249,6 +267,7 @@ void registrarAccesoServidor(String uid, String nombre, String tipoAcceso, Strin
     
     if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
       Serial.println("✓ Acceso registrado correctamente (" + String(httpCode) + ")");
+      Serial.println("Respuesta: " + payload);
     } else {
       Serial.println("⚠ Código de respuesta inesperado: " + String(httpCode));
       Serial.println("Respuesta servidor: " + payload);
@@ -258,5 +277,5 @@ void registrarAccesoServidor(String uid, String nombre, String tipoAcceso, Strin
   }
   
   http.end();
-  Serial.println("=======================================");
+  Serial.println("===========================================");
 }
